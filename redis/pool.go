@@ -125,6 +125,7 @@ type Pool struct {
 	//
 	// The connection returned from Dial must not be in a special state
 	// (subscribed to pubsub channel, transaction started, ...).
+	// 拨号函数 从外部注入
 	Dial func() (Conn, error)
 
 	// DialContext is an application supplied function for creating and configuring a
@@ -139,35 +140,44 @@ type Pool struct {
 	// the application. Argument t is the time that the connection was returned
 	// to the pool. If the function returns an error, then the connection is
 	// closed.
+	// 检测连接的可用性，从外部注入。如果返回error 则直接关闭连接
 	TestOnBorrow func(c Conn, t time.Time) error
 
 	// Maximum number of idle connections in the pool.
+	// 最大闲置连接数量
 	MaxIdle int
 
 	// Maximum number of connections allocated by the pool at a given time.
 	// When zero, there is no limit on the number of connections in the pool.
+	// 最大活动连接数
 	MaxActive int
 
 	// Close connections after remaining idle for this duration. If the value
 	// is zero, then idle connections are not closed. Applications should set
 	// the timeout to a value less than the server's timeout.
+	// 闲置过期时间 在get函数中会有逻辑 删除过期的连接
 	IdleTimeout time.Duration
 
 	// If Wait is true and the pool is at the MaxActive limit, then Get() waits
 	// for a connection to be returned to the pool before returning.
+	// 设置如果活动连接达到上限 再获取时候是等待还是返回错误
+	// 如果是false 系统会返回redigo: connection pool exhausted
+	// 如果是true 会利用p 的ch 属性让线程等待 知道有连接释放出来
 	Wait bool
 
 	// Close connections older than this duration. If the value is zero, then
 	// the pool does not close connections based on age.
+	// 连接最长生存时间 如果超过时间会被从链表中删除
 	MaxConnLifetime time.Duration
-
+	// 判断ch 是否被初始化了
 	chInitialized uint32 // set to 1 when field ch is initialized
-
+	// 锁
 	mu           sync.Mutex    // mu protects the following fields
 	closed       bool          // set to true when the pool is closed.
 	active       int           // the number of open connections in the pool
 	ch           chan struct{} // limits open connections when p.Wait is true
 	idle         idleList      // idle connections
+	// 等待获取连接的数量
 	waitCount    int64         // total number of connections waited for.
 	waitDuration time.Duration // total time waited for new connections.
 }
@@ -257,6 +267,7 @@ func (p *Pool) IdleCount() int {
 }
 
 // Close releases the resources used by the pool.
+// 关闭连接池 设置状态 清空限制链表
 func (p *Pool) Close() error {
 	p.mu.Lock()
 	if p.closed {
@@ -268,6 +279,7 @@ func (p *Pool) Close() error {
 	pc := p.idle.front
 	p.idle.count = 0
 	p.idle.front, p.idle.back = nil, nil
+	// 判断如果ch不为空 则 关闭ch 释放等待获取连接的
 	if p.ch != nil {
 		close(p.ch)
 	}
@@ -303,9 +315,10 @@ func (p *Pool) lazyInit() {
 // creates a new connection.
 func (p *Pool) get(ctx context.Context) (*poolConn, error) {
 
-	// Handle limit for p.Wait == true.
+	// 处理是否需要等待 pool Wait如果是true 则等待连接释放
 	var waited time.Duration
 	if p.Wait && p.MaxActive > 0 {
+		// 重新初始化pool的ch channel
 		p.lazyInit()
 
 		// wait indicates if we believe it will block so its not 100% accurate
@@ -315,6 +328,7 @@ func (p *Pool) get(ctx context.Context) (*poolConn, error) {
 		if wait {
 			start = time.Now()
 		}
+		// 获取pool 的ch通道，一旦有连接被close 则可以继续返回连接
 		if ctx == nil {
 			<-p.ch
 		} else {
@@ -330,13 +344,15 @@ func (p *Pool) get(ctx context.Context) (*poolConn, error) {
 	}
 
 	p.mu.Lock()
-
+	// 等待数量加1 增加等待时间
 	if waited > 0 {
 		p.waitCount++
 		p.waitDuration += waited
 	}
 
 	// Prune stale connections at the back of the idle list.
+	// 删除链表尾部的陈旧连接，删除超时的连接
+	// 连接close之后，连接会回到pool的idle(闲置)链表中
 	if p.IdleTimeout > 0 {
 		n := p.idle.count
 		for i := 0; i < n && p.idle.back != nil && p.idle.back.t.Add(p.IdleTimeout).Before(nowFunc()); i++ {
@@ -350,10 +366,13 @@ func (p *Pool) get(ctx context.Context) (*poolConn, error) {
 	}
 
 	// Get idle connection from the front of idle list.
+	// 获取链表空闲连接 拿链表第一个
 	for p.idle.front != nil {
 		pc := p.idle.front
 		p.idle.popFront()
 		p.mu.Unlock()
+		// 调用验证函数如果返回错误不为nil 关闭连接拿下一个
+		// 判断连接生存时间 大于生存时间则关闭拿下一个
 		if (p.TestOnBorrow == nil || p.TestOnBorrow(pc.c, pc.t) == nil) &&
 			(p.MaxConnLifetime == 0 || nowFunc().Sub(pc.created) < p.MaxConnLifetime) {
 			return pc, nil
@@ -364,20 +383,23 @@ func (p *Pool) get(ctx context.Context) (*poolConn, error) {
 	}
 
 	// Check for pool closed before dialing a new connection.
+	// 判断连接池是否被关闭 如果关闭则解锁报错
 	if p.closed {
 		p.mu.Unlock()
 		return nil, errors.New("redigo: get on closed pool")
 	}
 
 	// Handle limit for p.Wait == false.
+	// 如果活动连接大于最大连接解锁 返回错误
 	if !p.Wait && p.MaxActive > 0 && p.active >= p.MaxActive {
 		p.mu.Unlock()
 		return nil, ErrPoolExhausted
 	}
-
+	// 如果在链表中没有获取到可用的连接 并添加active数量添加
 	p.active++
 	p.mu.Unlock()
 	c, err := p.dial(ctx)
+	// 如果调用失败 则减少active数量
 	if err != nil {
 		c = nil
 		p.mu.Lock()
@@ -387,9 +409,11 @@ func (p *Pool) get(ctx context.Context) (*poolConn, error) {
 		}
 		p.mu.Unlock()
 	}
+	// 创建连接 设置创建时间
 	return &poolConn{c: c, created: nowFunc()}, err
 }
 
+// 拨号 调用注入的dial函数 返回连接
 func (p *Pool) dial(ctx context.Context) (Conn, error) {
 	if p.DialContext != nil {
 		return p.DialContext(ctx)
@@ -400,6 +424,7 @@ func (p *Pool) dial(ctx context.Context) (Conn, error) {
 	return nil, errors.New("redigo: must pass Dial or DialContext to pool")
 }
 
+// 将连接 重新放入限制链表
 func (p *Pool) put(pc *poolConn, forceClose bool) error {
 	p.mu.Lock()
 	if !p.closed && !forceClose {
@@ -419,7 +444,8 @@ func (p *Pool) put(pc *poolConn, forceClose bool) error {
 		p.mu.Lock()
 		p.active--
 	}
-
+	// 如果连接的ch 不为空 并且连接池没有关闭 则给channel中输入一个struct{}{}
+	// 如果在连接打到最大活动数量之后 再获取连接并且pool的Wait为ture 会阻塞线程等待返回连接
 	if p.ch != nil && !p.closed {
 		p.ch <- struct{}{}
 	}
@@ -456,7 +482,7 @@ func (ac *activeConn) Close() error {
 		return nil
 	}
 	ac.pc = nil
-
+	// 判断连接的状态 发送取消事务 取消watch
 	if ac.state&connectionMultiState != 0 {
 		pc.c.Send("DISCARD")
 		ac.state &^= (connectionMultiState | connectionWatchState)
@@ -484,6 +510,7 @@ func (ac *activeConn) Close() error {
 		}
 	}
 	pc.c.Do("")
+	// 把连接放入链表
 	ac.p.put(pc, ac.state != 0 || pc.c.Err() != nil)
 	return nil
 }

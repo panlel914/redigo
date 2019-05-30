@@ -35,18 +35,21 @@ var (
 
 // conn is the low-level implementation of Conn
 type conn struct {
-	// Shared
+	//  锁
 	mu      sync.Mutex
 	pending int
 	err     error
+	// http 包中的conn对象
 	conn    net.Conn
 
-	// Read
+	// 读入过期时间
 	readTimeout time.Duration
+	// bufio reader对象 用于读取redis服务返回的结果
 	br          *bufio.Reader
 
-	// Write
+	// 写入过期时间
 	writeTimeout time.Duration
+	// bufio writer对象 带buf 用于往服务端写命令
 	bw           *bufio.Writer
 
 	// Scratch space for formatting argument length.
@@ -176,6 +179,8 @@ func DialUseTLS(useTLS bool) DialOption {
 
 // Dial connects to the Redis server at the given network and
 // address using the specified options.
+// 拨号函数 设置redis地址和端口号，DialOption可以设置conn各种设置
+// 读入超时时间、写超时时间、redis数据库、客户端名字、密码、useTLS、tls配置等
 func Dial(network, address string, options ...DialOption) (Conn, error) {
 	do := dialOptions{
 		dialer: &net.Dialer{
@@ -386,6 +391,10 @@ func (c *conn) writeFloat64(n float64) error {
 	return c.writeBytes(strconv.AppendFloat(c.numScratch[:0], n, 'g', -1, 64))
 }
 
+// 把command写入到conn的write中
+// 1. 先写入*号
+// 2. 再写入command
+// 3. 最后写入参数
 func (c *conn) writeCommand(cmd string, args []interface{}) error {
 	c.writeLen('*', 1+len(args))
 	if err := c.writeString(cmd); err != nil {
@@ -399,6 +408,7 @@ func (c *conn) writeCommand(cmd string, args []interface{}) error {
 	return nil
 }
 
+// 根据不同类型下不同的参数
 func (c *conn) writeArg(arg interface{}, argumentTypeOK bool) (err error) {
 	switch arg := arg.(type) {
 	case string:
@@ -527,6 +537,7 @@ var (
 	pongReply interface{} = "PONG"
 )
 
+// 读取redis回复 通过判断回复雷星星 + - ： $来解析
 func (c *conn) readReply() (interface{}, error) {
 	line, err := c.readLine()
 	if err != nil {
@@ -652,11 +663,12 @@ func (c *conn) DoWithTimeout(readTimeout time.Duration, cmd string, args ...inte
 	if cmd == "" && pending == 0 {
 		return nil, nil
 	}
-
+	// 设置下入超时时间
 	if c.writeTimeout != 0 {
 		c.conn.SetWriteDeadline(time.Now().Add(c.writeTimeout))
 	}
 
+	// 如果cmd不为空则写入redis命令
 	if cmd != "" {
 		if err := c.writeCommand(cmd, args); err != nil {
 			return nil, c.fatal(err)
